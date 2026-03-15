@@ -18,7 +18,7 @@ from google.genai import types as genai_types
 # ─── Configuration ────────────────────────────────────────────────────────────
 VECTOR_STORE_PATH = os.path.join(os.path.dirname(__file__), "vector_store.json")
 EMBEDDING_MODEL = "models/gemini-embedding-001"   # Gemini embedding model
-LLM_MODEL       = "gemini-1.5-flash"
+LLM_MODEL       = "gemini-2.5-flash"
 TOP_K = 5
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
