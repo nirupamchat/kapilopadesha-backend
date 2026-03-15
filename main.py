@@ -1,30 +1,31 @@
 """
 FastAPI backend for the Kapilopadesha Lecture Q&A app.
-Loads pre-built vector store at startup and serves Q&A via semantic search + Gemini.
-Uses the new google-genai package (replaces deprecated google-generativeai).
+Uses Google Gemini for BOTH embeddings and answer generation.
+No local ML models — starts instantly so Render can detect the port.
 """
 
 import json
 import os
+import asyncio
 import numpy as np
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai as google_genai
-from sentence_transformers import SentenceTransformer
+from google.genai import types as genai_types
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 VECTOR_STORE_PATH = os.path.join(os.path.dirname(__file__), "vector_store.json")
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-LLM_MODEL = "gemini-1.5-flash"
-TOP_K = 5  # number of chunks to retrieve per query
+EMBEDDING_MODEL = "models/gemini-embedding-001"   # Gemini embedding model
+LLM_MODEL       = "gemini-1.5-flash"
+TOP_K = 5
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Kapilopadesha Lecture Q&A API",
     description="Ask questions about the Kapilopadesha lecture series by Swami Ishatmananda",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -36,16 +37,16 @@ app.add_middleware(
 )
 
 # ─── Global State ─────────────────────────────────────────────────────────────
-vector_store = None
+vector_store      = None
 embeddings_matrix = None
-embedding_model = None
-gemini_client = None  # google-genai client
+gemini_client     = None
+_ready            = False   # set to True once everything is loaded
 
 
 # ─── Pydantic Models ──────────────────────────────────────────────────────────
 class QuestionRequest(BaseModel):
     question: str
-    video_filter: Optional[str] = None  # optional: filter by video_id
+    video_filter: Optional[str] = None
 
 
 class SourceCitation(BaseModel):
@@ -70,10 +71,10 @@ class VideoInfo(BaseModel):
     playlist_index: int
 
 
-# ─── Startup ──────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup_event():
-    global vector_store, embeddings_matrix, embedding_model, gemini_client
+# ─── Background Loader ────────────────────────────────────────────────────────
+async def _load_resources():
+    """Load vector store and init Gemini client in the background."""
+    global vector_store, embeddings_matrix, gemini_client, _ready
 
     print("Loading vector store...")
     with open(VECTOR_STORE_PATH) as f:
@@ -90,26 +91,38 @@ async def startup_event():
     embeddings_matrix = embeddings_matrix / norms
     print(f"Embeddings matrix shape: {embeddings_matrix.shape}")
 
-    # Load embedding model (local, no API key needed)
-    print(f"Loading embedding model: {EMBEDDING_MODEL_NAME}...")
-    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    print("Embedding model loaded.")
-
-    # Initialize Google Gemini client using new google-genai package
+    # Initialize Gemini client
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_api_key:
         print("WARNING: GEMINI_API_KEY not set — Q&A will not work!")
     else:
         gemini_client = google_genai.Client(api_key=gemini_api_key)
-        print(f"Gemini client initialized with model '{LLM_MODEL}'.")
+        print("Gemini client initialized.")
 
-    print("Backend ready!")
+    _ready = True
+    print("Backend fully ready!")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Start the background loader WITHOUT awaiting it.
+    This lets uvicorn bind the port immediately, satisfying Render's health check,
+    while the vector store and Gemini client load in the background.
+    """
+    asyncio.create_task(_load_resources())
+    print("Server started — loading resources in background...")
 
 
 # ─── Helper Functions ─────────────────────────────────────────────────────────
 def embed_query(text: str) -> np.ndarray:
-    """Embed a query string and return normalized vector."""
-    vec = embedding_model.encode([text])[0].astype(np.float32)
+    """Embed a query string using Gemini and return a normalized vector."""
+    response = gemini_client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=text,
+        config=genai_types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
+    )
+    vec = np.array(response.embeddings[0].values, dtype=np.float32)
     norm = np.linalg.norm(vec)
     if norm > 0:
         vec = vec / norm
@@ -168,7 +181,7 @@ ANSWER:"""
 async def root():
     return {
         "message": "Kapilopadesha Lecture Q&A API",
-        "status": "running",
+        "status": "ready" if _ready else "loading",
         "total_chunks": len(vector_store["chunks"]) if vector_store else 0,
         "total_videos": len(vector_store["videos"]) if vector_store else 0
     }
@@ -177,26 +190,24 @@ async def root():
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy",
-        "model": EMBEDDING_MODEL_NAME,
+        "status": "ready" if _ready else "loading",
         "llm": LLM_MODEL,
+        "embedding_model": EMBEDDING_MODEL,
         "gemini_ready": gemini_client is not None
     }
 
 
 @app.get("/videos", response_model=List[VideoInfo])
 async def list_videos():
-    """Return all ingested lecture videos."""
     if not vector_store:
-        raise HTTPException(status_code=503, detail="Vector store not loaded")
+        raise HTTPException(status_code=503, detail="Vector store still loading, please retry in a moment")
     return vector_store["videos"]
 
 
 @app.post("/ask", response_model=AnswerResponse)
 async def ask_question(request: QuestionRequest):
-    """Answer a question using semantic search + Gemini."""
-    if not vector_store:
-        raise HTTPException(status_code=503, detail="Vector store not loaded")
+    if not _ready:
+        raise HTTPException(status_code=503, detail="Backend still loading, please retry in a moment")
     if not gemini_client:
         raise HTTPException(status_code=503, detail="Gemini client not initialized. Please set GEMINI_API_KEY.")
 
@@ -204,21 +215,21 @@ async def ask_question(request: QuestionRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    # Semantic search
+    # Semantic search using Gemini embeddings
     relevant_chunks = semantic_search(question, top_k=TOP_K, video_filter=request.video_filter)
     if not relevant_chunks:
         raise HTTPException(status_code=404, detail="No relevant content found")
 
-    # Build prompt and call Gemini using new google-genai API
+    # Build prompt and call Gemini
     prompt = build_prompt(question, relevant_chunks)
     try:
         response = gemini_client.models.generate_content(
             model=LLM_MODEL,
             contents=prompt,
-            config={
-                "max_output_tokens": 800,
-                "temperature": 0.3,
-            }
+            config=genai_types.GenerateContentConfig(
+                max_output_tokens=800,
+                temperature=0.3,
+            )
         )
         answer = response.text.strip()
     except Exception as e:
@@ -249,8 +260,8 @@ async def ask_question(request: QuestionRequest):
 @app.get("/search")
 async def search_transcripts(q: str, top_k: int = 5):
     """Raw semantic search without LLM generation."""
-    if not vector_store:
-        raise HTTPException(status_code=503, detail="Vector store not loaded")
+    if not _ready:
+        raise HTTPException(status_code=503, detail="Backend still loading, please retry in a moment")
     results = semantic_search(q, top_k=top_k)
     return {
         "query": q,
@@ -269,4 +280,4 @@ async def search_transcripts(q: str, top_k: int = 5):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
