@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
 """
 FastAPI backend for the Kapilopadesha Lecture Q&A app.
-Loads pre-built vector store at startup and serves Q&A via semantic search + GPT.
+Loads pre-built vector store at startup and serves Q&A via semantic search + Gemini.
 """
 
 import json
@@ -11,13 +10,13 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
+import google.generativeai as genai
 from sentence_transformers import SentenceTransformer
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 VECTOR_STORE_PATH = os.path.join(os.path.dirname(__file__), "vector_store.json")
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-LLM_MODEL = "gpt-4.1-mini"
+LLM_MODEL = "gemini-1.5-flash"
 TOP_K = 5  # number of chunks to retrieve per query
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
@@ -39,7 +38,7 @@ app.add_middleware(
 vector_store = None
 embeddings_matrix = None
 embedding_model = None
-openai_client = None
+gemini_model = None
 
 
 # ─── Pydantic Models ──────────────────────────────────────────────────────────
@@ -73,7 +72,7 @@ class VideoInfo(BaseModel):
 # ─── Startup ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
-    global vector_store, embeddings_matrix, embedding_model, openai_client
+    global vector_store, embeddings_matrix, embedding_model, gemini_model
 
     print("Loading vector store...")
     with open(VECTOR_STORE_PATH) as f:
@@ -91,17 +90,27 @@ async def startup_event():
     embeddings_matrix = embeddings_matrix / norms
     print(f"Embeddings matrix shape: {embeddings_matrix.shape}")
 
-    # Load embedding model
+    # Load embedding model (local, no API key needed)
     print(f"Loading embedding model: {EMBEDDING_MODEL_NAME}...")
     embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
     print("Embedding model loaded.")
 
-    # Initialize OpenAI client (uses OPENAI_API_KEY env var)
-    openai_client = OpenAI(
-        api_key=os.environ.get("OPENAI_API_KEY"),
-        base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    )
-    print("OpenAI client initialized.")
+    # Initialize Google Gemini client
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_api_key:
+        print("WARNING: GEMINI_API_KEY not set — Q&A will not work!")
+    else:
+        genai.configure(api_key=gemini_api_key)
+        gemini_model = genai.GenerativeModel(
+            model_name=LLM_MODEL,
+            system_instruction=(
+                "You are an expert on Vedanta and Sankhya philosophy, specifically the "
+                "Kapilopadesha teachings from the Bhagavata Purana as explained by "
+                "Swami Ishatmananda."
+            )
+        )
+        print(f"Gemini model '{LLM_MODEL}' initialized.")
+
     print("Backend ready!")
 
 
@@ -115,16 +124,15 @@ def embed_query(text: str) -> np.ndarray:
     return vec
 
 
-def semantic_search(query: str, top_k: int = TOP_K, video_filter: str = None) -> List[dict]:
-    """Find top-k most relevant chunks using cosine similarity."""
-    query_vec = embed_query(query)
+def semantic_search(query: str, top_k: int = TOP_K, video_filter: Optional[str] = None) -> List[dict]:
+    """Find the most semantically similar chunks to the query."""
     chunks = vector_store["chunks"]
+    query_vec = embed_query(query)
 
-    # Filter by video if requested
     if video_filter:
         indices = [i for i, c in enumerate(chunks) if c["video_id"] == video_filter]
         if not indices:
-            indices = list(range(len(chunks)))
+            return []
         filtered_matrix = embeddings_matrix[indices]
         scores = filtered_matrix @ query_vec
         top_local = np.argsort(scores)[::-1][:top_k]
@@ -140,7 +148,6 @@ def semantic_search(query: str, top_k: int = TOP_K, video_filter: str = None) ->
         chunk = chunks[idx].copy()
         chunk["score"] = float(score)
         results.append(chunk)
-
     return results
 
 
@@ -152,7 +159,6 @@ def build_prompt(question: str, chunks: List[dict]) -> str:
             f"[Excerpt {i} — {chunk['title']}, at {chunk['timestamp']}]\n{chunk['text']}"
         )
     context = "\n\n".join(context_parts)
-
     return f"""You are a knowledgeable assistant helping students understand the Kapilopadesha lecture series — teachings on Sankhya philosophy and Vedanta by Swami Ishatmananda, based on the Bhagavata Purana.
 
 Answer the question below using ONLY the provided lecture excerpts. Be precise, clear, and educational. If the excerpts do not contain enough information to answer the question, say so honestly. Always refer to specific concepts from the lectures.
@@ -191,9 +197,11 @@ async def list_videos():
 
 @app.post("/ask", response_model=AnswerResponse)
 async def ask_question(request: QuestionRequest):
-    """Answer a question using semantic search + GPT."""
+    """Answer a question using semantic search + Gemini."""
     if not vector_store:
         raise HTTPException(status_code=503, detail="Vector store not loaded")
+    if not gemini_model:
+        raise HTTPException(status_code=503, detail="Gemini model not initialized. Please set GEMINI_API_KEY.")
 
     question = request.question.strip()
     if not question:
@@ -201,32 +209,22 @@ async def ask_question(request: QuestionRequest):
 
     # Semantic search
     relevant_chunks = semantic_search(question, top_k=TOP_K, video_filter=request.video_filter)
-
     if not relevant_chunks:
         raise HTTPException(status_code=404, detail="No relevant content found")
 
-    # Build prompt and call LLM
+    # Build prompt and call Gemini
     prompt = build_prompt(question, relevant_chunks)
-
     try:
-        response = openai_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert on Vedanta and Sankhya philosophy, specifically the Kapilopadesha teachings from the Bhagavata Purana as explained by Swami Ishatmananda."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            max_tokens=800,
-            temperature=0.3
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=800,
+                temperature=0.3,
+            )
         )
-        answer = response.choices[0].message.content.strip()
+        answer = response.text.strip()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Gemini error: {str(e)}")
 
     # Build source citations
     sources = []
