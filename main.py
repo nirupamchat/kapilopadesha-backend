@@ -1,6 +1,7 @@
 """
 FastAPI backend for the Kapilopadesha Lecture Q&A app.
 Loads pre-built vector store at startup and serves Q&A via semantic search + Gemini.
+Uses the new google-genai package (replaces deprecated google-generativeai).
 """
 
 import json
@@ -10,7 +11,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import google.generativeai as genai
+from google import genai as google_genai
 from sentence_transformers import SentenceTransformer
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -23,7 +24,7 @@ TOP_K = 5  # number of chunks to retrieve per query
 app = FastAPI(
     title="Kapilopadesha Lecture Q&A API",
     description="Ask questions about the Kapilopadesha lecture series by Swami Ishatmananda",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -38,7 +39,7 @@ app.add_middleware(
 vector_store = None
 embeddings_matrix = None
 embedding_model = None
-gemini_model = None
+gemini_client = None  # google-genai client
 
 
 # ─── Pydantic Models ──────────────────────────────────────────────────────────
@@ -72,7 +73,7 @@ class VideoInfo(BaseModel):
 # ─── Startup ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
-    global vector_store, embeddings_matrix, embedding_model, gemini_model
+    global vector_store, embeddings_matrix, embedding_model, gemini_client
 
     print("Loading vector store...")
     with open(VECTOR_STORE_PATH) as f:
@@ -84,7 +85,6 @@ async def startup_event():
     # Build numpy matrix for fast cosine similarity
     print("Building embeddings matrix...")
     embeddings_matrix = np.array([c["embedding"] for c in chunks], dtype=np.float32)
-    # Normalize for cosine similarity
     norms = np.linalg.norm(embeddings_matrix, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1, norms)
     embeddings_matrix = embeddings_matrix / norms
@@ -95,21 +95,13 @@ async def startup_event():
     embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
     print("Embedding model loaded.")
 
-    # Initialize Google Gemini client
+    # Initialize Google Gemini client using new google-genai package
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_api_key:
         print("WARNING: GEMINI_API_KEY not set — Q&A will not work!")
     else:
-        genai.configure(api_key=gemini_api_key)
-        gemini_model = genai.GenerativeModel(
-            model_name=LLM_MODEL,
-            system_instruction=(
-                "You are an expert on Vedanta and Sankhya philosophy, specifically the "
-                "Kapilopadesha teachings from the Bhagavata Purana as explained by "
-                "Swami Ishatmananda."
-            )
-        )
-        print(f"Gemini model '{LLM_MODEL}' initialized.")
+        gemini_client = google_genai.Client(api_key=gemini_api_key)
+        print(f"Gemini client initialized with model '{LLM_MODEL}'.")
 
     print("Backend ready!")
 
@@ -184,7 +176,12 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "model": EMBEDDING_MODEL_NAME, "llm": LLM_MODEL}
+    return {
+        "status": "healthy",
+        "model": EMBEDDING_MODEL_NAME,
+        "llm": LLM_MODEL,
+        "gemini_ready": gemini_client is not None
+    }
 
 
 @app.get("/videos", response_model=List[VideoInfo])
@@ -200,8 +197,8 @@ async def ask_question(request: QuestionRequest):
     """Answer a question using semantic search + Gemini."""
     if not vector_store:
         raise HTTPException(status_code=503, detail="Vector store not loaded")
-    if not gemini_model:
-        raise HTTPException(status_code=503, detail="Gemini model not initialized. Please set GEMINI_API_KEY.")
+    if not gemini_client:
+        raise HTTPException(status_code=503, detail="Gemini client not initialized. Please set GEMINI_API_KEY.")
 
     question = request.question.strip()
     if not question:
@@ -212,15 +209,16 @@ async def ask_question(request: QuestionRequest):
     if not relevant_chunks:
         raise HTTPException(status_code=404, detail="No relevant content found")
 
-    # Build prompt and call Gemini
+    # Build prompt and call Gemini using new google-genai API
     prompt = build_prompt(question, relevant_chunks)
     try:
-        response = gemini_model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=800,
-                temperature=0.3,
-            )
+        response = gemini_client.models.generate_content(
+            model=LLM_MODEL,
+            contents=prompt,
+            config={
+                "max_output_tokens": 800,
+                "temperature": 0.3,
+            }
         )
         answer = response.text.strip()
     except Exception as e:
