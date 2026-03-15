@@ -227,7 +227,7 @@ async def ask_question(request: QuestionRequest):
             model=LLM_MODEL,
             contents=prompt,
             config=genai_types.GenerateContentConfig(
-                max_output_tokens=800,
+                max_output_tokens=2000,
                 temperature=0.3,
             )
         )
